@@ -11,10 +11,17 @@ class BotManager {
     this.isManualStop = false;
     this.reconnectTimer = null;
     this.antiAfkTimer = null;
+    this.menuRetryInterval = null;
+    this.survivalTimer = null;
     this.state = 'offline';
-    this.hasClickedGui = false;
-    this.postCommandsSent = false;
+    
+    // Stage flags
     this.loginSent = false;
+    this.inLobby = false;
+    this.hasClickedGui = false;
+    this.inSurvival = false;
+    this.postCommandsSent = false;
+
     this.chatHistory = [];
     this.actionLogs = [];
   }
@@ -36,7 +43,7 @@ class BotManager {
       version: false,
       password: 'tynorix',
       autoLogin: true,
-      loginDelayMs: 3000,
+      loginDelayMs: 2500,
       hotbarSlot: 2,
       useItemAfterSwitch: true,
       useItemDelayMs: 2000,
@@ -46,7 +53,7 @@ class BotManager {
       postCommands: ['/sit', '/afk'],
       postCommandsDelayMs: 6000,
       autoReconnect: true,
-      reconnectDelayMs: 10000,
+      reconnectDelayMs: 8000,
       antiAfk: true,
       antiAfkIntervalMs: 30000
     };
@@ -79,7 +86,23 @@ class BotManager {
   updateState(newState, details = '') {
     this.state = newState;
     this.onEvent('state', { state: this.state, details });
-    this.log('status', `Status changed: ${newState.toUpperCase()} ${details ? `(${details})` : ''}`);
+    this.log('status', `Status: ${newState.toUpperCase()} ${details ? `- ${details}` : ''}`);
+  }
+
+  clearTimers() {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    if (this.menuRetryInterval) {
+      clearInterval(this.menuRetryInterval);
+      this.menuRetryInterval = null;
+    }
+    if (this.survivalTimer) {
+      clearTimeout(this.survivalTimer);
+      this.survivalTimer = null;
+    }
+    this.stopAntiAfk();
   }
 
   start() {
@@ -88,15 +111,13 @@ class BotManager {
       return;
     }
 
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
-
+    this.clearTimers();
     this.isManualStop = false;
-    this.hasClickedGui = false;
-    this.postCommandsSent = false;
     this.loginSent = false;
+    this.inLobby = false;
+    this.hasClickedGui = false;
+    this.inSurvival = false;
+    this.postCommandsSent = false;
 
     this.updateState('connecting', `Connecting to ${this.config.host}:${this.config.port} as ${this.config.username}`);
 
@@ -125,11 +146,7 @@ class BotManager {
 
   stop() {
     this.isManualStop = true;
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
-    this.stopAntiAfk();
+    this.clearTimers();
 
     if (this.bot) {
       this.log('system', 'Stopping bot by user request...');
@@ -147,22 +164,53 @@ class BotManager {
     const bot = this.bot;
 
     bot.on('login', () => {
-      this.log('minecraft', `Bot logged in to server protocol. Waiting for world spawn...`);
-      this.updateState('logging_in');
+      this.log('minecraft', `Bot connected to protocol. Preparing authentication...`);
+      this.updateState('logging_in', 'Connected to Auth Gateway');
+
+      // Auto login backup timer: If no chat prompt is detected within 3 seconds, send login command anyway
+      setTimeout(() => {
+        if (this.bot && !this.loginSent) {
+          this.log('system', 'Auto-login timer fired. Executing login command...');
+          this.executeLoginCommand();
+        }
+      }, parseInt(this.config.loginDelayMs, 10) || 2500);
     });
 
-    bot.once('spawn', () => {
-      this.log('minecraft', `Bot spawned in world! Position: ${bot.entity?.position ? bot.entity.position.floored() : 'unknown'}`);
-      this.updateState('spawned');
-      this.executeJoinSequence();
+    bot.on('spawn', () => {
+      const pos = bot.entity?.position ? bot.entity.position.floored() : 'unknown';
+      this.log('minecraft', `Bot world spawn detected at ${pos}`);
+
+      if (!this.loginSent) {
+        this.executeLoginCommand();
+      }
+
+      // If we haven't clicked GUI yet, we are either in Auth or arriving at the Lobby
+      if (!this.hasClickedGui) {
+        // Wait 2.5 seconds for lobby chunks and inventory items to populate
+        setTimeout(() => {
+          if (!this.hasClickedGui && this.bot) {
+            this.startLobbyRoutine();
+          }
+        }, 2500);
+      }
     });
 
-    // Handle respawn or server change (BungeeCord / Velocity transfer to survival)
+    // Detect server transfer (e.g. Auth -> Lobby or Lobby -> Survival)
     bot.on('respawn', () => {
-      this.log('minecraft', 'Server respawn / dimension change detected.');
-      if (this.hasClickedGui && !this.postCommandsSent) {
-        this.log('system', 'Detected server transfer to Survival after GUI click.');
+      this.log('minecraft', 'Server transfer / respawn packet received.');
+
+      if (this.hasClickedGui && !this.inSurvival) {
+        // We clicked the pickaxe and server changed -> Entering Survival!
+        this.log('system', 'Server transfer to Survival detected!');
         this.scheduleSurvivalCommands();
+      } else if (!this.hasClickedGui) {
+        // Server transferred from Auth to Lobby!
+        this.log('system', 'Transferred to Lobby. Initializing server selector sequence...');
+        setTimeout(() => {
+          if (!this.hasClickedGui && this.bot) {
+            this.startLobbyRoutine();
+          }
+        }, 2500);
       }
     });
 
@@ -176,17 +224,29 @@ class BotManager {
       };
       this.chatHistory.push(chatEntry);
       if (this.chatHistory.length > 300) this.chatHistory.shift();
-
       this.onEvent('chat', chatEntry);
 
-      // Check for login / auth prompts in chat
       const lower = plainText.toLowerCase();
-      if ((lower.includes('/login') || lower.includes('please login')) && !this.loginSent) {
-        this.log('system', 'Server requested /login. Executing login command...');
+
+      // Check for /login prompt
+      if ((lower.includes('/login') || lower.includes('please login') || lower.includes('type /login')) && !this.loginSent) {
+        this.log('system', 'Server requested /login. Executing...');
         this.executeLoginCommand();
+      }
+
+      // Check for login success
+      if (lower.includes('successful') || lower.includes('logged in') || lower.includes('welcome back') || lower.includes('auth')) {
+        this.log('system', 'Login acknowledged. Moving to Lobby...');
+        this.inLobby = true;
+        setTimeout(() => {
+          if (!this.hasClickedGui && this.bot) {
+            this.startLobbyRoutine();
+          }
+        }, 2500);
       }
     });
 
+    // Window open event (Chest GUI)
     bot.on('windowOpen', (window) => {
       this.handleWindowOpen(window);
     });
@@ -203,8 +263,8 @@ class BotManager {
     });
 
     bot.on('end', (reason) => {
-      this.log('warn', `Bot connection ended: ${reason || 'Disconnected'}`);
-      this.stopAntiAfk();
+      this.log('warn', `Connection ended: ${reason || 'Disconnected'}`);
+      this.clearTimers();
       this.bot = null;
       if (!this.isManualStop) {
         this.updateState('offline', 'Disconnected');
@@ -215,7 +275,7 @@ class BotManager {
     });
 
     bot.on('error', (err) => {
-      this.log('error', `Bot network/client error: ${err.message}`);
+      this.log('error', `Bot error: ${err.message}`);
       this.updateState('error', err.message);
     });
   }
@@ -228,114 +288,148 @@ class BotManager {
     this.loginSent = true;
   }
 
-  executeJoinSequence() {
-    // Step 1: Login after delay
-    const loginDelay = parseInt(this.config.loginDelayMs, 10) || 3000;
-    setTimeout(() => {
-      if (!this.bot) return;
+  startLobbyRoutine() {
+    if (this.hasClickedGui || this.menuRetryInterval) return;
 
-      if (this.config.autoLogin && !this.loginSent) {
-        this.executeLoginCommand();
+    this.log('action', 'Starting Lobby Routine: Selecting Server Selector Item...');
+    this.updateState('opening_menu', 'Selecting Hotbar Item in Lobby');
+
+    const slotNumber = parseInt(this.config.hotbarSlot, 10) || 2;
+    const quickBarIndex = Math.max(0, Math.min(8, slotNumber - 1));
+
+    let attempts = 0;
+    const attemptOpenMenu = () => {
+      if (!this.bot || this.hasClickedGui || this.inSurvival) {
+        if (this.menuRetryInterval) {
+          clearInterval(this.menuRetryInterval);
+          this.menuRetryInterval = null;
+        }
+        return;
       }
 
-      // Step 2: Switch to configured hotbar slot (default 2 -> index 1)
-      const useItemDelay = parseInt(this.config.useItemDelayMs, 10) || 2000;
-      setTimeout(() => {
-        if (!this.bot) return;
+      attempts++;
+      this.log('action', `[Attempt ${attempts}/8] Switching to hotbar slot ${slotNumber} (index ${quickBarIndex}) & activating item...`);
 
-        const slotNumber = parseInt(this.config.hotbarSlot, 10) || 2;
-        const quickBarIndex = Math.max(0, Math.min(8, slotNumber - 1));
-        this.log('action', `Switching to hotbar slot ${slotNumber} (index ${quickBarIndex})...`);
-        
-        try {
-          this.bot.setQuickBarSlot(quickBarIndex);
-          this.updateState('opening_menu', `Selected hotbar slot ${slotNumber}`);
+      try {
+        // Set hotbar slot (slot 2 = index 1)
+        this.bot.setQuickBarSlot(quickBarIndex);
 
-          if (this.config.useItemAfterSwitch) {
-            setTimeout(() => {
-              if (!this.bot) return;
-              this.log('action', 'Activating held item to open server selector GUI...');
-              try {
-                this.bot.activateItem();
-              } catch (e) {
-                this.log('warn', `activateItem error: ${e.message}`);
-              }
-            }, 800);
-          }
-        } catch (err) {
-          this.log('error', `Failed to switch hotbar slot: ${err.message}`);
+        // Subtle look forward & activate item
+        if (this.bot.entity) {
+          this.bot.look(this.bot.entity.yaw, 0, true);
         }
-      }, useItemDelay);
 
-    }, loginDelay);
+        setTimeout(() => {
+          if (!this.bot || this.hasClickedGui) return;
+          try {
+            // Activate held item
+            this.bot.activateItem();
+            // Swing arm (interact animation)
+            this.bot.swingArm('right');
+          } catch (e) {
+            this.log('warn', `Error activating item: ${e.message}`);
+          }
+        }, 400);
+
+      } catch (err) {
+        this.log('error', `Failed to set hotbar slot: ${err.message}`);
+      }
+
+      if (attempts >= 8) {
+        this.log('warn', 'Max attempts reached for opening server selector. You can manually use the dashboard or re-run routine.');
+        if (this.menuRetryInterval) {
+          clearInterval(this.menuRetryInterval);
+          this.menuRetryInterval = null;
+        }
+      }
+    };
+
+    // Run first attempt immediately, then retry every 2.5 seconds if chest GUI hasn't opened yet
+    attemptOpenMenu();
+    this.menuRetryInterval = setInterval(attemptOpenMenu, 2500);
   }
 
   handleWindowOpen(window) {
-    this.log('minecraft', `Chest/Inventory GUI opened: "${window.title || 'Chest'}" (Total Slots: ${window.slots.length})`);
-    this.updateState('clicking_item', 'Navigating Server Selector');
+    if (this.menuRetryInterval) {
+      clearInterval(this.menuRetryInterval);
+      this.menuRetryInterval = null;
+    }
 
-    setTimeout(() => {
-      if (!this.bot) return;
+    const title = window.title || 'Chest';
+    const totalSlots = window.slots.length;
+    this.log('minecraft', `Server Selector GUI opened: "${title}" (${totalSlots} slots)`);
+    this.updateState('clicking_item', `GUI "${title}" open`);
 
-      let targetSlot = null;
+    // Give the server 800ms to send slot items
+    setTimeout(async () => {
+      if (!this.bot || this.hasClickedGui) return;
+
+      const targetSlot = parseInt(this.config.guiTargetSlot, 10) !== undefined ? parseInt(this.config.guiTargetSlot, 10) : 11;
       const targetItemName = (this.config.guiTargetItem || 'diamond_pickaxe').toLowerCase();
-      const preferredSlot = parseInt(this.config.guiTargetSlot, 10);
 
-      // Scan slots
+      let clickIndex = targetSlot;
+
+      // Scan window items to see if target item is located at another slot
       for (let i = 0; i < window.slots.length; i++) {
         const item = window.slots[i];
         if (!item) continue;
-
         const itemName = (item.name || '').toLowerCase();
-        const customName = item.customName ? item.customName.toLowerCase() : '';
-
-        // Match by item name (e.g. diamond_pickaxe)
-        if (itemName.includes(targetItemName) || targetItemName.includes(itemName)) {
-          targetSlot = i;
-          this.log('action', `Found target item "${item.name}" at slot ${i}!`);
+        if (itemName.includes(targetItemName)) {
+          clickIndex = i;
+          this.log('action', `Found target "${item.name}" at slot ${i}!`);
           break;
         }
       }
 
-      // If name search didn't match or mode requires slot
-      if (targetSlot === null && !isNaN(preferredSlot) && preferredSlot >= 0 && preferredSlot < window.slots.length) {
-        targetSlot = preferredSlot;
-        const slotItem = window.slots[preferredSlot];
-        this.log('action', `Using fallback slot ${preferredSlot} (Item: ${slotItem ? slotItem.name : 'empty'}).`);
-      }
+      this.log('action', `Clicking slot ${clickIndex} (Diamond Pickaxe) to join Survival...`);
 
-      if (targetSlot !== null) {
-        this.log('action', `Clicking slot ${targetSlot} in GUI to join Survival...`);
-        try {
-          this.bot.clickWindow(targetSlot, 0, 0); // 0 = left click, 0 = normal click
-          this.hasClickedGui = true;
-          this.updateState('transferring', `Clicked slot ${targetSlot}. Transferring to Survival...`);
+      try {
+        // Mode 0, button 0 = standard left click
+        await this.bot.clickWindow(clickIndex, 0, 0);
+        this.hasClickedGui = true;
+        this.updateState('transferring', `Clicked slot ${clickIndex}. Joining Survival...`);
 
-          // Fallback timer: if no respawn event fires, still schedule post commands
-          setTimeout(() => {
-            if (!this.postCommandsSent && this.bot) {
-              this.scheduleSurvivalCommands();
+        // Schedule survival commands after transfer
+        const delay = parseInt(this.config.postCommandsDelayMs, 10) || 6000;
+        this.survivalTimer = setTimeout(() => {
+          if (!this.inSurvival && this.bot) {
+            this.scheduleSurvivalCommands();
+          }
+        }, delay);
+
+      } catch (err) {
+        this.log('error', `Failed to click slot ${clickIndex}: ${err.message}`);
+        // Try fallback click after 1 second if window is still open
+        setTimeout(async () => {
+          if (!this.hasClickedGui && this.bot && this.bot.currentWindow) {
+            this.log('action', `Retrying click on slot ${clickIndex}...`);
+            try {
+              await this.bot.clickWindow(clickIndex, 0, 0);
+              this.hasClickedGui = true;
+            } catch (e) {
+              this.log('error', `Retry click failed: ${e.message}`);
             }
-          }, parseInt(this.config.postCommandsDelayMs, 10) || 6000);
-
-        } catch (err) {
-          this.log('error', `Failed to click window slot ${targetSlot}: ${err.message}`);
-        }
-      } else {
-        this.log('warn', `Could not find "${targetItemName}" or slot ${preferredSlot} in open window.`);
+          }
+        }, 1000);
       }
-    }, 1200);
+    }, 800);
   }
 
   scheduleSurvivalCommands() {
-    if (this.postCommandsSent) return;
+    if (this.inSurvival || this.postCommandsSent) return;
+    this.inSurvival = true;
     this.postCommandsSent = true;
+
+    if (this.menuRetryInterval) {
+      clearInterval(this.menuRetryInterval);
+      this.menuRetryInterval = null;
+    }
 
     this.log('system', 'Bot entered Survival server! Preparing commands...');
     this.updateState('in_survival', 'Survival Mode Active');
 
     const commands = Array.isArray(this.config.postCommands) ? this.config.postCommands : ['/sit', '/afk'];
-    let delay = 1000;
+    let delay = 1500;
 
     commands.forEach((cmd, idx) => {
       setTimeout(() => {
@@ -347,7 +441,7 @@ class BotManager {
         }
 
         if (idx === commands.length - 1) {
-          this.log('system', 'All post-join commands completed! AFK routine active.');
+          this.log('system', 'Completed post-join commands (/sit and /afk). Bot is now AFK grinding!');
           if (this.config.antiAfk) {
             this.startAntiAfk();
           }
@@ -360,14 +454,14 @@ class BotManager {
   startAntiAfk() {
     this.stopAntiAfk();
     const interval = Math.max(10000, parseInt(this.config.antiAfkIntervalMs, 10) || 30000);
-    this.log('system', `Anti-AFK keep-alive routine enabled (every ${interval / 1000}s).`);
+    this.log('system', `Anti-AFK keep-alive active (every ${interval / 1000}s).`);
 
     this.antiAfkTimer = setInterval(() => {
-      if (!this.bot || this.state !== 'in_survival') return;
+      if (!this.bot || !this.inSurvival) return;
       try {
-        // Subtle arm swing
+        // Swing right arm
         this.bot.swingArm('right');
-        // Subtle sneak toggle or head turn
+        // Subtle yaw adjustment
         if (this.bot.entity) {
           const newYaw = this.bot.entity.yaw + (Math.random() * 0.1 - 0.05);
           this.bot.look(newYaw, this.bot.entity.pitch, true);
@@ -390,13 +484,13 @@ class BotManager {
       return;
     }
 
-    const delay = parseInt(this.config.reconnectDelayMs, 10) || 10000;
-    this.log('system', `Auto-reconnect triggered. Reconnecting in ${delay / 1000}s...`);
+    const delay = parseInt(this.config.reconnectDelayMs, 10) || 8000;
+    this.log('system', `Auto-reconnect scheduled in ${delay / 1000}s...`);
 
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = setTimeout(() => {
       if (!this.isManualStop) {
-        this.log('system', 'Attempting reconnect now...');
+        this.log('system', 'Reconnecting now...');
         this.start();
       }
     }, delay);
@@ -410,7 +504,7 @@ class BotManager {
     if (!clean) {
       return { success: false, error: 'Message cannot be empty.' };
     }
-    this.log('user_chat', `Manual message sent: ${clean}`);
+    this.log('user_chat', `Manual command sent: ${clean}`);
     this.bot.chat(clean);
     return { success: true };
   }
@@ -421,10 +515,10 @@ class BotManager {
       return { success: true, message: 'Bot started and executing routine.' };
     }
     this.hasClickedGui = false;
+    this.inSurvival = false;
     this.postCommandsSent = false;
-    this.loginSent = false;
-    this.log('system', 'Manually re-running routine (Hotbar -> GUI -> Survival)...');
-    this.executeJoinSequence();
+    this.log('system', 'Manually re-running Lobby -> Survival routine...');
+    this.startLobbyRoutine();
     return { success: true, message: 'Routine restarted.' };
   }
 

@@ -5,15 +5,13 @@ const path = require('path');
 const BotManager = require('./botManager');
 
 const app = express();
-const server = http.createServer(app);
-const io = new Server(server, {
+const io = new Server({
   cors: {
     origin: '*',
     methods: ['GET', 'POST']
   }
 });
 
-const PORT = process.env.PORT || 3000;
 const CONFIG_PATH = path.join(__dirname, 'config.json');
 
 app.use(express.json());
@@ -70,7 +68,6 @@ app.post('/api/config', (req, res) => {
 
 // Socket.IO Events
 io.on('connection', (socket) => {
-  // Send current state and recent logs on connection
   socket.emit('init', botManager.getStatus());
 
   socket.on('send_chat', (msg) => {
@@ -91,14 +88,36 @@ io.on('connection', (socket) => {
   });
 });
 
-// Start web server
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`===============================================`);
-  console.log(`  MCNP Action Grinder - AFK Bot Dashboard`);
-  console.log(`  Server listening on: http://0.0.0.0:${PORT}`);
-  console.log(`  Railway Port: ${PORT}`);
-  console.log(`===============================================`);
+// Start multi-port listeners so Railway works whether it targets 3000, 8080, or process.env.PORT
+const targetPorts = new Set();
+if (process.env.PORT) {
+  targetPorts.add(parseInt(process.env.PORT, 10));
+}
+targetPorts.add(3000);
+targetPorts.add(8080);
 
-  // Auto-start bot on boot if desired
-  botManager.start();
+targetPorts.forEach((port) => {
+  try {
+    const s = http.createServer(app);
+    io.attach(s);
+    s.listen(port, '0.0.0.0', () => {
+      console.log(`[Dashboard] Listening on http://0.0.0.0:${port}`);
+    });
+    s.on('error', (err) => {
+      // If port is already bound, skip quietly
+      if (err.code !== 'EADDRINUSE') {
+        console.error(`Error on port ${port}:`, err.message);
+      }
+    });
+  } catch (err) {
+    // ignore
+  }
 });
+
+console.log(`===============================================`);
+console.log(`  MCNP Action Grinder - AFK Bot Dashboard`);
+console.log(`  Active on Railway and Local environments`);
+console.log(`===============================================`);
+
+// Boot the bot
+botManager.start();

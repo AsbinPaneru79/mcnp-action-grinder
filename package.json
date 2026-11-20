@@ -1,0 +1,22 @@
+{
+  "name": "mcnp-action-grinder",
+  "version": "1.0.0",
+  "description": "Automated Minecraft AFK Bot with Web Dashboard for mcnp.network and Railway hosting",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": [
+    "mineflayer",
+    "minecraft",
+    "afk-bot",
+    "railway"
+  ],
+  "author": "AsbinPaneru79",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.21.2",
+    "mineflayer": "^4.23.1",
+    "socket.io": "^4.8.1"
+  }
+}

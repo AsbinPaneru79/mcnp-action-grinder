@@ -1,0 +1,25 @@
+{
+  "host": "mcnp.network",
+  "port": 25565,
+  "username": "BreezeGuy",
+  "auth": "offline",
+  "version": false,
+  "password": "tynorix",
+  "autoLogin": true,
+  "loginDelayMs": 3000,
+  "hotbarSlot": 2,
+  "useItemAfterSwitch": true,
+  "useItemDelayMs": 2000,
+  "guiTargetMode": "name_or_slot",
+  "guiTargetItem": "diamond_pickaxe",
+  "guiTargetSlot": 11,
+  "postCommands": [
+    "/sit",
+    "/afk"
+  ],
+  "postCommandsDelayMs": 6000,
+  "autoReconnect": true,
+  "reconnectDelayMs": 8000,
+  "antiAfk": true,
+  "antiAfkIntervalMs": 30000
+}
